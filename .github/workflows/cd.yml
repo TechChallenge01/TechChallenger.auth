@@ -1,0 +1,121 @@
+name: CD
+
+# Roda somente em push na main -> build/push da imagem, provisionamento (idempotente)
+# e atualização do código da Lambda em produção.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: techchallenge-auth
+  FUNCTION_NAME: techchallenge-auth
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore TechChallenger.auth/TechChallenger.auth.csproj
+
+      - name: Build
+        run: dotnet build TechChallenger.auth/TechChallenger.auth.csproj --no-restore --configuration Release
+
+  build-push-image:
+    needs: build-test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      tag: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS Academy (temporárias)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build e push da imagem Docker
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker build -f TechChallenger.auth/Dockerfile -t "$IMAGE_URI" TechChallenger.auth
+          docker push "$IMAGE_URI"
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  provision-infra:
+    needs: build-push-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS Academy (temporárias)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init/apply
+        working-directory: terraform
+        env:
+          TF_VAR_db_connection_string: ${{ secrets.RDS_CONNECTION_STRING }}
+          TF_VAR_jwt_key: ${{ secrets.JWT_KEY }}
+          TF_VAR_datadog_api_key: ${{ secrets.DATADOG_API_KEY }}
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+  deploy:
+    needs: [build-push-image, provision-infra]
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ needs.build-push-image.outputs.image }}
+    steps:
+      - name: Configurar credenciais AWS Academy (temporárias)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Atualizar código da função Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ env.FUNCTION_NAME }}" \
+            --image-uri "${{ env.IMAGE }}"
+          aws lambda wait function-updated \
+            --function-name "${{ env.FUNCTION_NAME }}"
+
+      - name: Mostrar URL pública da API
+        run: |
+          aws apigatewayv2 get-apis \
+            --query "Items[?Name=='techchallenge-auth-gateway'].ApiEndpoint" \
+            --output text

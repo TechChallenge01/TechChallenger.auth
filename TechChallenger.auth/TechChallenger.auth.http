@@ -1,6 +1,0 @@
-@TechChallenger.auth_HostAddress = http://localhost:5082
-
-GET {{TechChallenger.auth_HostAddress}}/weatherforecast/
-Accept: application/json
-
-###
