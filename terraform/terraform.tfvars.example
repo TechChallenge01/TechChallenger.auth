@@ -1,0 +1,18 @@
+# Copie para terraform.tfvars (gitignored) e preencha, OU exporte como TF_VAR_*.
+# A esteira de CD passa estes valores via GitHub Secrets (ver .github/workflows/cd.yml).
+
+# Connection string do MESMO RDS SQL Server usado pela TechChallenge API.
+# A Lambda de auth so faz SELECT na tabela Clientes.
+db_connection_string = "Server=techchallenge-sqlserver.ctwb99xc7935.us-east-1.rds.amazonaws.com,1433;Database=AppDb;User Id=dbadmin;Password=SENHA_DO_RDS;TrustServerCertificate=True;Encrypt=True;"
+
+# IDENTICA a Jwt:Key da TechChallenge API — os tokens precisam ser intercambiaveis.
+jwt_key = "f3a7c9b8e1d2a3f4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8"
+
+# Opcional. Vazio = sem instrumentacao Datadog (Lambda em subnet privada sem NAT).
+# datadog_api_key = ""
+
+# Sobrescritos automaticamente pela esteira; util para apply manual:
+# image_tag        = "latest"
+# aws_region       = "us-east-1"
+# eks_cluster_name = "techchallenge"
+# app_node_port    = 30080

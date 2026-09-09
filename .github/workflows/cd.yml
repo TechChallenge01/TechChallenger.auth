@@ -1,0 +1,84 @@
+name: CD
+
+# Deploy automatico:
+#   push em release -> homologacao  (workflow_dispatch tambem, para redeploy manual)
+#   push em main    -> producao
+# Branch main protegida: entra so via Pull Request.
+on:
+  push:
+    branches: [release, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: techchallenge-auth
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'homolog' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build .NET (sanidade)
+        run: |
+          dotnet restore TechChallenger.auth/TechChallenger.auth.csproj
+          dotnet build TechChallenger.auth/TechChallenger.auth.csproj --no-restore -c Release
+
+      - name: Credenciais AWS Academy (temporarias)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+
+      # O Terraform e dono do repositorio ECR. Criamos so ele primeiro, para
+      # ter onde dar push da imagem antes do apply completo (a Lambda de imagem
+      # nao e criada sem uma imagem existente).
+      - name: Terraform apply (somente ECR)
+        working-directory: terraform
+        run: terraform apply -auto-approve -target=aws_ecr_repository.auth -target=aws_ecr_lifecycle_policy.auth
+
+      - name: Build e push da imagem
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          docker build -f TechChallenger.auth/Dockerfile -t "$IMAGE" -t "$REGISTRY/$ECR_REPOSITORY:latest" TechChallenger.auth
+          docker push "$IMAGE"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform apply (completo)
+        working-directory: terraform
+        env:
+          TF_VAR_image_tag: ${{ steps.image.outputs.tag }}
+          TF_VAR_db_connection_string: ${{ secrets.RDS_CONNECTION_STRING }}
+          TF_VAR_jwt_key: ${{ secrets.JWT_KEY }}
+          TF_VAR_datadog_api_key: ${{ secrets.DATADOG_API_KEY }}
+        run: |
+          terraform apply -auto-approve
+          echo "### Endpoints" >> "$GITHUB_STEP_SUMMARY"
+          terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$GITHUB_STEP_SUMMARY"
