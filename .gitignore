@@ -131,3 +131,7 @@ $RECYCLE.BIN/
 .DS_Store
 
 _NCrunch*
+# Artefatos de teste local (contem segredos / nao versionar)
+auth.local.env
+/event.json
+ev_*.json

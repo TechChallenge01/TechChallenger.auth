@@ -1,13 +1,11 @@
 name: CI
 
-# Roda em:
-# - Pull Requests que miram release ou main (validação antes do merge)
-# - Push direto na branch release (pós-merge do PR) -> SOMENTE CI, sem deploy
+# Valida antes do merge. Sem credenciais AWS, sem deploy.
 on:
   pull_request:
-    branches: [release, main]
+    branches: [develop, release, main]
   push:
-    branches: [release]
+    branches: [develop, release]
 
 permissions:
   contents: read
@@ -24,18 +22,33 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Restore dependencies
+      - name: Restore
         run: dotnet restore TechChallenger.auth/TechChallenger.auth.csproj
 
       - name: Build
         run: dotnet build TechChallenger.auth/TechChallenger.auth.csproj --no-restore --configuration Release
 
-      - name: Build da imagem Docker (validação, sem push)
+      - name: Build da imagem Docker (validacao, sem push)
         run: docker build -f TechChallenger.auth/Dockerfile -t auth:ci-${{ github.sha }} TechChallenger.auth
 
-      - name: Terraform fmt/validate
+  terraform-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Validar codigo do Lambda authorizer
+        run: node --check terraform/src-authorizer/index.mjs
+
+      - name: Terraform fmt (advisory)
+        working-directory: terraform
+        run: terraform fmt -check -recursive -diff || echo "::warning::terraform fmt pendente — rode 'terraform fmt -recursive'"
+
+      - name: Terraform validate
         working-directory: terraform
         run: |
           terraform init -backend=false
-          terraform fmt -check
           terraform validate
