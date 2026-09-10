@@ -31,7 +31,7 @@ O *JWT authorizer* nativo do API Gateway v2 só valida tokens assimétricos (RS2
 - `Amazon.Lambda.AspNetCoreServer.Hosting` — permite rodar o mesmo `Program.cs` localmente (Kestrel) e dentro da Lambda (Runtime API), sem duplicar código
 - Entity Framework Core (SQL Server) — leitura da tabela `Clientes`
 - `System.IdentityModel.Tokens.Jwt` — emissão do JWT
-- Datadog (`Datadog.Trace.Bundle` + Lambda Extension) — tracing e métricas serverless
+- Datadog — via **Log Forwarder** (CloudWatch → Datadog); a Lambda em si não é instrumentada em processo (subnet privada sem NAT)
 - Docker (imagem de container, runtime `public.ecr.aws/lambda/dotnet:8`)
 - Terraform — provisiona ECR, a Lambda de auth (em VPC), o Lambda authorizer, o API Gateway (HTTP API), o VPC Link e o NLB interno na frente do EKS
 - GitHub Actions — CI (build + validação do Dockerfile/Terraform) e CD (build/push da imagem + `terraform apply`)
@@ -149,8 +149,7 @@ A imagem base `public.ecr.aws/lambda/dotnet:8` já traz o RIE na porta `8080`.
 ```bash
 docker build -f TechChallenger.auth/Dockerfile -t techchallenge-auth:local TechChallenger.auth
 
-docker run -d --name tc-auth --mount type=tmpfs,destination=/opt/extensions \
-  -p 9000:8080 \
+docker run -d --name tc-auth -p 9000:8080 \
   -e ConnectionStrings__DefaultConnection="Server=host.docker.internal,1433;Database=AppDb;User Id=sa;Password=SUA_SENHA;TrustServerCertificate=True;" \
   -e Jwt__Key="f3a7c9b8e1d2a3f4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" \
   -e Jwt__Issuer="TechChallenger" -e Jwt__Audience="TechChallenger" -e Jwt__ExpiracaoHoras="8" \
@@ -160,8 +159,6 @@ docker run -d --name tc-auth --mount type=tmpfs,destination=/opt/extensions \
 curl -s "http://localhost:9000/2015-03-31/functions/function/invocations" --data-binary @event.json
 ```
 
-> **`--mount type=tmpfs,destination=/opt/extensions`** é obrigatório no teste local: sem uma `DD_API_KEY` válida a Datadog Lambda Extension embutida na imagem entra em loop de erro e **segura a resposta** do RIE. Em produção a extensão não bloqueia (o Lambda real não espera o extension para responder), mas até a observabilidade estar de fato conectada considere removê-la do `Dockerfile`.
-
 ## Deploy (Terraform + CI/CD)
 
 A infraestrutura provisionada pelo Terraform em [`terraform/`](terraform):
@@ -170,7 +167,8 @@ A infraestrutura provisionada pelo Terraform em [`terraform/`](terraform):
 |---|---|---|
 | Data sources da infra compartilhada | `data.tf` | Descobre VPC, subnets privadas, SG do RDS, cluster/ASG do EKS e a `LabRole` — nada é criado |
 | Repositório ECR | `ecr.tf` | Registry da imagem da Lambda de auth |
-| Lambda de auth (Image) + SG + log group | `lambda_auth.tf` | Roda a imagem do ECR **dentro da VPC** (subnets privadas) para alcançar o RDS; env vars de Jwt/connection string/Datadog; regra aditiva liberando `1433` no SG do RDS |
+| Lambda de auth (Image) + SG + log group | `lambda_auth.tf` | Roda a imagem do ECR **dentro da VPC** (subnets privadas) para alcançar o RDS; env vars de Jwt/connection string; regra aditiva liberando `1433` no SG do RDS |
+| Datadog Log Forwarder + subscription filters | `observability.tf` | Lambda **fora da VPC** que encaminha os log groups (auth, authorizer, API Gateway) para o Datadog. Criado só quando `datadog_api_key` é definida |
 | Lambda authorizer (Node 20) | `lambda_authorizer.tf` + `src-authorizer/` | Valida o `Bearer` JWT HS256 na borda |
 | NLB interno + target group + attach do node group | `nlb.tf` | Alvo do VPC Link; registra os nodes do EKS na porta `NodePort` da API principal |
 | API Gateway HTTP API, rotas, authorizer, VPC Link, stage/logs | `apigateway.tf` | `POST /auth/cpf` + `GET /health` → Lambda; `ANY /api/{proxy+}` → EKS via VPC Link, protegido pelo authorizer; log de acesso em JSON |
@@ -239,7 +237,7 @@ Branch `main` protegida (sem commit direto, merge somente via Pull Request). Flu
 | `TF_STATE_BUCKET` | Nome do bucket S3 do state (ex.: `techchallenge-tfstate-<ACCOUNT_ID>`) |
 | `RDS_CONNECTION_STRING` | Connection string do mesmo RDS SQL Server usado pela TechChallenge API |
 | `JWT_KEY` | **Idêntica** à `Jwt:Key` configurada na TechChallenge API |
-| `DATADOG_API_KEY` | API Key do Datadog (opcional — ver nota em Observabilidade) |
+| `DATADOG_API_KEY` | API Key do Datadog. Quando presente, o `terraform apply` cria o Log Forwarder (ver Observabilidade). Vazio = sem forwarder |
 
 > Se preferir manter tudo em um só ambiente por causa do orçamento do AWS Academy, aponte `release` e `main` para os mesmos recursos (é o padrão atual: mesmo `name_prefix`). Um ambiente de homologação isolado dobra o custo de NLB/Lambda.
 
@@ -250,12 +248,21 @@ Branch `main` protegida (sem commit direto, merge somente via Pull Request). Flu
 - **Correlação** — a integração da rota protegida injeta `x-request-id = $context.requestId` no header repassado ao EKS, para o log da TechChallenge API amarrar na mesma requisição.
 - **Lambdas** — logs em `/aws/lambda/techchallenge-auth` e `/aws/lambda/techchallenge-auth-authorizer` (a Lambda em VPC entrega logs ao CloudWatch normalmente, sem precisar de NAT).
 
-### Datadog (opcional)
-A imagem já traz a **Datadog Lambda Extension** e o `Datadog.Trace.Bundle`. As variáveis `DD_*` só são injetadas (`terraform/lambda_auth.tf`) quando o secret `DATADOG_API_KEY` está preenchido.
+### Datadog — via Log Forwarder
 
-> ⚠️ A Lambda de auth roda em **subnet privada sem NAT Gateway** (opção de custo do lab). Sem NAT ou VPC endpoint, a extensão do Datadog não consegue exportar para fora. Para instrumentação completa: mover a Lambda para fora da VPC (e liberar o RDS por outro caminho), adicionar um NAT (~US$32/mês) ou VPC endpoints. Enquanto isso, a observabilidade da auth fica via CloudWatch (métricas de invocação nativas do Lambda + os log groups acima). O authorizer é Node puro, sem Datadog.
+A Lambda de auth roda em **subnet privada sem NAT Gateway** (opção de custo do lab), então **não tem saída para a internet** e não pode exportar direto para o Datadog. Por isso a instrumentação em processo (extensão / `Datadog.Trace.Bundle`) foi **removida da imagem**.
 
-Ver a seção "Observabilidade" do [README da TechChallenge API](https://github.com/TechChallenge01/TechChallenge) para os dashboards (volume diário de OS, tempo médio por status, erros de integração) e alertas do lado da API principal.
+No lugar, quando o secret `DATADOG_API_KEY` está preenchido, o `terraform apply` cria o **Datadog Log Forwarder** (`observability.tf`): uma Lambda **fora da VPC** (com egress) inscrita nos log groups do CloudWatch da auth, do authorizer e do API Gateway. Ela lê os eventos e os encaminha para o Datadog. É o padrão recomendado pela AWS/Datadog para observar recursos sem saída para a internet.
+
+```
+/aws/lambda/techchallenge-auth ─────────┐
+/aws/lambda/techchallenge-auth-authorizer ├─► subscription filter ─► dd-forwarder (fora da VPC) ─► Datadog
+/aws/apigateway/techchallenge-auth ──────┘
+```
+
+Sem `DATADOG_API_KEY`: sem forwarder — a observabilidade da auth fica pelo CloudWatch (métricas nativas de invocação do Lambda: duração, erros, throttles, cold starts) + os log groups acima, consultáveis no CloudWatch Logs Insights.
+
+Ver a seção "Observabilidade" do [README da TechChallenge API](https://github.com/TechChallenge01/TechChallenge) para o agente Datadog no EKS, os dashboards (volume diário de OS, tempo médio por status, erros de integração) e os alertas do lado da API principal.
 
 ## Notas importantes
 - Este serviço **não escreve** no banco — apenas lê `Id`, `Nome`, `Cpf`, `Email` e `Ativo` da tabela `Clientes`, já criada e migrada pela TechChallenge API.
