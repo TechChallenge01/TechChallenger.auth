@@ -15,7 +15,16 @@ Este repositório é um dos quatro que compõem o Tech Challenge:
 ## Por que este desenho
 A TechChallenge API já expõe rotas protegidas por perfil (`Administrador`, `Funcionario`, `Mecanico`, `Almoxarifado`, `Cliente`) validadas com JWT. O que faltava era um jeito do **cliente final** (dono do veículo) se autenticar sem senha — usando apenas o CPF já cadastrado — para consultar e aprovar suas próprias ordens de serviço. Extrair isso para uma function serverless, atrás de um API Gateway, evita subir mais um serviço "sempre ligado" no cluster só para um fluxo de baixíssimo volume/latência tolerante, e é exatamente o padrão pedido pelo desafio (Auth API Gateway + Function Serverless).
 
-O token emitido aqui usa **a mesma chave de assinatura, issuer e audience** (`Jwt:Key` / `Jwt:Issuer` / `Jwt:Audience`) configurados na TechChallenge API — os dois serviços só compartilham um segredo, não código ou banco de escrita. A API principal não precisa saber que o token foi emitido por uma Lambda: ela só valida a assinatura, como já fazia.
+O token emitido aqui usa **a mesma chave de assinatura, issuer e audience** (`Jwt:Key` / `Jwt:Issuer` / `Jwt:Audience`) configurados na TechChallenge API — os dois serviços só compartilham um segredo, não código ou banco de escrita.
+
+Este repositório também provisiona o **API Gateway como porta única de entrada de todo o sistema**:
+
+| Rota no gateway | Destino | Proteção |
+|---|---|---|
+| `POST /auth/cpf`, `GET /health` | Lambda de auth | pública (é onde o token é emitido) |
+| `ANY /api/{proxy+}` | TechChallenge API no EKS (via **VPC Link** → NLB interno) | **Lambda authorizer** valida o `Bearer` JWT (HS256) antes de encaminhar |
+
+O *JWT authorizer* nativo do API Gateway v2 só valida tokens assimétricos (RS256/JWKS). Como o token do projeto é **HS256** (chave simétrica compartilhada), a validação no gateway é feita por um **Lambda authorizer** próprio (`terraform/src-authorizer/`, Node 20, sem dependências), com cache de 300s. A API principal continua validando o token internamente — o authorizer é uma segunda barreira na borda, não a substitui.
 
 ## Tecnologias utilizadas
 - .NET 8 (ASP.NET Core Minimal APIs)
@@ -24,32 +33,34 @@ O token emitido aqui usa **a mesma chave de assinatura, issuer e audience** (`Jw
 - `System.IdentityModel.Tokens.Jwt` — emissão do JWT
 - Datadog (`Datadog.Trace.Bundle` + Lambda Extension) — tracing e métricas serverless
 - Docker (imagem de container, runtime `public.ecr.aws/lambda/dotnet:8`)
-- Terraform — provisiona o repositório ECR, a função Lambda e o API Gateway (HTTP API)
-- GitHub Actions — CI (build + validação do Dockerfile/Terraform) e CD (build/push da imagem + deploy)
+- Terraform — provisiona ECR, a Lambda de auth (em VPC), o Lambda authorizer, o API Gateway (HTTP API), o VPC Link e o NLB interno na frente do EKS
+- GitHub Actions — CI (build + validação do Dockerfile/Terraform) e CD (build/push da imagem + `terraform apply`)
 
 ## Arquitetura
 
 ```mermaid
 flowchart LR
     Cliente((Cliente)) -->|POST /auth/cpf| APIGW[API Gateway<br/>HTTP API]
-    APIGW --> Lambda[Lambda<br/>TechChallenge.auth]
-    Lambda -->|SELECT ... FROM Clientes<br/>WHERE Cpf = @cpf| RDS[(RDS SQL Server<br/>compartilhado)]
-    Lambda -->|JWT assinado com<br/>o mesmo Jwt:Key| Cliente
-    Cliente -->|Authorization: Bearer <token>| API[TechChallenge API<br/>no EKS]
+    Cliente -->|ANY /api/*<br/>Authorization: Bearer| APIGW
+    APIGW -->|rota pública| Lambda[Lambda auth<br/>TechChallenge.auth<br/>subnet privada]
+    APIGW -->|rota protegida| AUTHZ[Lambda authorizer<br/>valida HS256]
+    APIGW -->|VPC Link| NLB[NLB interno]
+    NLB --> API[TechChallenge API<br/>EKS · NodePort]
+    Lambda -->|SELECT ... FROM Clientes| RDS[(RDS SQL Server<br/>compartilhado)]
     API --> RDS
-    Lambda -.->|traces/metrics| DD[(Datadog)]
-    API -.->|traces/metrics/logs| DD
+    Lambda -.->|JWT assinado com o mesmo Jwt:Key| Cliente
 ```
 
-### Fluxo de autenticação
+### Fluxo de autenticação e consumo de rota protegida
 
 ```mermaid
 sequenceDiagram
     participant C as Cliente
     participant GW as API Gateway
     participant L as Lambda (auth)
+    participant AZ as Lambda authorizer
     participant DB as RDS (Clientes)
-    participant API as TechChallenge API
+    participant API as TechChallenge API (EKS)
 
     C->>GW: POST /auth/cpf { cpf }
     GW->>L: invoke (proxy)
@@ -63,28 +74,39 @@ sequenceDiagram
     else inativo
         L-->>C: 403 Forbidden
     else ativo
-        L->>L: gera JWT (sub=ClienteId, role=Cliente)
+        L->>L: gera JWT (sub=ClienteId, role=Cliente, HS256)
         L-->>C: 200 { token, expiracao, clienteId, nome }
     end
-    C->>API: GET /api/ordemServico/{id}<br/>Authorization: Bearer token
-    API->>API: valida assinatura/issuer/audience (mesmo Jwt:Key)
-    API-->>C: 200 (somente se ClienteId do token == dono da OS)
+
+    C->>GW: GET /api/ordemServico/{id}<br/>Authorization: Bearer <token>
+    GW->>AZ: invoke authorizer (header Authorization)
+    AZ->>AZ: valida assinatura/exp/iss/aud (mesmo Jwt:Key)
+    alt token inválido/ausente
+        AZ-->>GW: isAuthorized = false
+        GW-->>C: 401 Unauthorized
+    else válido (resultado cacheado 300s)
+        AZ-->>GW: isAuthorized = true (+ contexto)
+        GW->>API: proxy via VPC Link + NLB<br/>(header x-request-id p/ correlação)
+        API->>API: revalida o JWT internamente
+        API-->>C: 200 (se ClienteId do token == dono da OS)
+    end
 ```
 
 ## Endpoint
 
-**Base URL:** `{API_INVOKE_URL}` (saída `api_invoke_url` do Terraform)
+**Base URL:** saída `api_base_url` do Terraform (ex.: `https://abc123.execute-api.us-east-1.amazonaws.com/`)
 
-| Método | Rota | Descrição | Status |
-|---|---|---|---|
-| POST | `/auth/cpf` | Autentica um cliente pelo CPF e devolve um JWT | 200, 400, 403, 404 |
-| GET | `/health` | Healthcheck | 200 |
+| Método | Rota | Descrição | Auth | Status |
+|---|---|---|---|---|
+| POST | `/auth/cpf` | Autentica um cliente pelo CPF e devolve um JWT | pública | 200, 400, 403, 404 |
+| GET | `/health` | Healthcheck da Lambda de auth | pública | 200 |
+| ANY | `/api/{proxy+}` | Encaminha para a TechChallenge API no EKS | `Authorization: Bearer <jwt>` (Lambda authorizer) | 401 se o token faltar/for inválido; senão o status da API |
 
 **Request:**
 ```json
 POST /auth/cpf
 {
-  "cpf": "50872558843"
+  "cpf": "52998224725"
 }
 ```
 
@@ -92,11 +114,12 @@ POST /auth/cpf
 ```json
 {
   "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "expiracao": "2026-09-02T06:00:00Z",
-  "clienteId": "550e8400-e29b-41d4-a716-446655440000",
-  "nome": "João da Silva"
+  "expiracao": "2026-09-09T09:53:39Z",
+  "clienteId": "22222222-0000-0000-0000-000000000001",
+  "nome": "João Pereira"
 }
 ```
+(`52998224725` é um dos CPFs criados pelo seeder da TechChallenge API — ver `src/Infra/DbInitializer/DbSeeds.cs` naquele repo.)
 
 **Erros:**
 - `400` — CPF com formato ou dígitos verificadores inválidos
@@ -119,12 +142,25 @@ dotnet run
 
 A aplicação sobe em `http://localhost:5082`, com as mesmas configurações de banco/JWT do `appsettings.Development.json`. Ajuste `ConnectionStrings:DefaultConnection` para apontar para o mesmo banco da TechChallenge API — este serviço só faz leitura da tabela `Clientes`, não roda migrations.
 
-### Rodando a imagem de container localmente
+### Rodando a imagem de container localmente (Runtime Interface Emulator)
+
+A imagem base `public.ecr.aws/lambda/dotnet:8` já traz o RIE na porta `8080`.
+
 ```bash
-docker build -f TechChallenger.auth/Dockerfile -t techchallenge-auth TechChallenger.auth
-docker run --rm -e ConnectionStrings__DefaultConnection="..." -e Jwt__Key="..." -p 9000:8080 techchallenge-auth
+docker build -f TechChallenger.auth/Dockerfile -t techchallenge-auth:local TechChallenger.auth
+
+docker run -d --name tc-auth --mount type=tmpfs,destination=/opt/extensions \
+  -p 9000:8080 \
+  -e ConnectionStrings__DefaultConnection="Server=host.docker.internal,1433;Database=AppDb;User Id=sa;Password=SUA_SENHA;TrustServerCertificate=True;" \
+  -e Jwt__Key="f3a7c9b8e1d2a3f4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8" \
+  -e Jwt__Issuer="TechChallenger" -e Jwt__Audience="TechChallenger" -e Jwt__ExpiracaoHoras="8" \
+  techchallenge-auth:local
+
+# invocar com um evento de API Gateway HTTP API v2 (rawPath /auth/cpf, method POST, body com o cpf)
+curl -s "http://localhost:9000/2015-03-31/functions/function/invocations" --data-binary @event.json
 ```
-(imagens baseadas em `public.ecr.aws/lambda/dotnet:8` expõem a Runtime Interface Emulator na porta 8080 — use o [aws-lambda-rie](https://docs.aws.amazon.com/lambda/latest/dg/images-test.html) para invocar localmente como se fosse o Lambda Runtime API.)
+
+> **`--mount type=tmpfs,destination=/opt/extensions`** é obrigatório no teste local: sem uma `DD_API_KEY` válida a Datadog Lambda Extension embutida na imagem entra em loop de erro e **segura a resposta** do RIE. Em produção a extensão não bloqueia (o Lambda real não espera o extension para responder), mas até a observabilidade estar de fato conectada considere removê-la do `Dockerfile`.
 
 ## Deploy (Terraform + CI/CD)
 
@@ -132,44 +168,94 @@ A infraestrutura provisionada pelo Terraform em [`terraform/`](terraform):
 
 | Recurso | Arquivo | Descrição |
 |---|---|---|
-| Repositório ECR | `ecr.tf` | Registry da imagem da Lambda, publicada pela esteira de CD |
-| Function Lambda (Image) | `lambda.tf` | Roda a imagem publicada no ECR; variáveis de ambiente (Jwt, connection string, Datadog) |
-| API Gateway HTTP API | `apigateway.tf` | Rotas `POST /auth/cpf` e `GET /health`, integração `AWS_PROXY` com a Lambda |
-| IAM (LabRole) | `iam.tf` | Reaproveita a role padrão do AWS Academy Learner Lab |
+| Data sources da infra compartilhada | `data.tf` | Descobre VPC, subnets privadas, SG do RDS, cluster/ASG do EKS e a `LabRole` — nada é criado |
+| Repositório ECR | `ecr.tf` | Registry da imagem da Lambda de auth |
+| Lambda de auth (Image) + SG + log group | `lambda_auth.tf` | Roda a imagem do ECR **dentro da VPC** (subnets privadas) para alcançar o RDS; env vars de Jwt/connection string/Datadog; regra aditiva liberando `1433` no SG do RDS |
+| Lambda authorizer (Node 20) | `lambda_authorizer.tf` + `src-authorizer/` | Valida o `Bearer` JWT HS256 na borda |
+| NLB interno + target group + attach do node group | `nlb.tf` | Alvo do VPC Link; registra os nodes do EKS na porta `NodePort` da API principal |
+| API Gateway HTTP API, rotas, authorizer, VPC Link, stage/logs | `apigateway.tf` | `POST /auth/cpf` + `GET /health` → Lambda; `ANY /api/{proxy+}` → EKS via VPC Link, protegido pelo authorizer; log de acesso em JSON |
+| IAM (LabRole) | `data.tf` | Reaproveita a role padrão do AWS Academy (o lab bloqueia `iam:CreateRole`) |
+| Variáveis / outputs / backend S3 | `variables.tf`, `outputs.tf`, `provider.tf` | — |
 
-```bash
+### Pré-requisitos
+
+- **Infra base já provisionada** pelo repo [`TechChallenger.k8s`](https://github.com/TechChallenge01/TechChallenger.k8s): VPC `techchallenge-vpc`, subnets `techchallenge-private-*`, SG `techchallenge-sqlserver-sg`, cluster EKS `techchallenge`, RDS `techchallenge-sqlserver`. Os `data source` deste repo (`data.tf`) leem tudo por tag — se os nomes divergirem, ajuste as `variable`s.
+- **API principal no EKS** com Service `NodePort 30080` — feito no branch `feat/service-nodeport-apigateway` do repo `TechChallenge` (`k8s/service.yaml` + `k8s/configmap.yaml`). Sem isso a rota `/api/{proxy+}` sobe mas responde 5xx (NLB sem alvo saudável).
+- **Bucket de state S3** (o `provider.tf` usa backend S3 — o state tem segredos, não pode ser local nem commitado). Troque `792146652061` pelo Account ID do seu lab:
+  ```bash
+  aws s3api create-bucket --bucket techchallenge-tfstate-792146652061 --region us-east-1
+  aws s3api put-bucket-versioning --bucket techchallenge-tfstate-792146652061 --versioning-configuration Status=Enabled
+  ```
+- **AWS CLI v2** autenticado com as credenciais temporárias do AWS Academy (`~/.aws/credentials`, bloco `[default]` com `aws_session_token`) e região `us-east-1` (`aws configure set region us-east-1`).
+
+### Deploy manual — sequência testada (PowerShell)
+
+O deploy é em 3 partes porque uma Lambda de imagem não sobe sem a imagem já existir no ECR.
+
+```powershell
 cd terraform
-terraform init
-terraform apply \
-  -var="db_connection_string=<CONNECTION_STRING_DO_RDS>" \
-  -var="jwt_key=<MESMA_CHAVE_DA_TECHCHALLENGE_API>" \
-  -var="datadog_api_key=<DATADOG_API_KEY>"
+Copy-Item terraform.tfvars.example terraform.tfvars   # preencher db_connection_string (aponta pro RDS) e jwt_key
+terraform init -backend-config="bucket=techchallenge-tfstate-792146652061"
+
+# 1) criar só o ECR  (no PowerShell o -target precisa de aspas)
+terraform apply "-target=aws_ecr_repository.auth" "-target=aws_ecr_lifecycle_policy.auth"
+
+# 2) build + push da imagem — FORMATO IMPORTA (ver notas)
+$ECR = terraform output -raw ecr_repository_url
+$pw = (aws ecr get-login-password --region us-east-1).Trim()
+docker login -u AWS -p $pw ($ECR.Split('/')[0])
+docker buildx build --platform linux/amd64 --provenance=false --sbom=false -t "${ECR}:latest" -f ..\TechChallenger.auth\Dockerfile --load ..\TechChallenger.auth
+docker push "${ECR}:latest"
+
+# 3) apply completo
+terraform apply -var="image_tag=latest"
+terraform output
 ```
 
-O primeiro `apply` cria a função Lambda apontando para a tag `latest` do ECR (que ainda não existe — o primeiro push da esteira de CD resolve isso). Depois desse provisionamento inicial, a esteira **não roda `terraform apply` a cada mudança de código**: ela builda a imagem, dá push no ECR com a tag do commit e chama `aws lambda update-function-code --image-uri`, que é bem mais rápido.
+**Notas de deploy (aprendidas na integração):**
+- A imagem **precisa** ser buildada com `docker buildx build --provenance=false --sbom=false --platform linux/amd64 --load`. O build padrão do Docker Desktop (buildx + containerd) gera um manifesto OCI com atestação que o AWS Lambda rejeita (`The image manifest ... is not supported`).
+- No PowerShell, `aws ecr get-login-password | docker login --password-stdin` falha com `400 Bad Request` (o pipe vai em UTF-16). Use `docker login -u AWS -p $pw <registry>`.
+- Se a Lambda de auth precisar alcançar o RDS e ele estiver em subnet privada sem NAT, tudo bem — Lambda e RDS na mesma VPC se enxergam pelo IP privado; a regra de SG que libera o `1433` é criada por este Terraform (`lambda_auth.tf`).
+
+### Destruir
+
+```powershell
+cd terraform
+terraform destroy   # usa o terraform.tfvars
+```
+Destrua **este** stack antes do repo `TechChallenger.k8s` (ele adiciona regras nos SGs do RDS e do cluster que precisam sair primeiro).
 
 ### Pipeline (`.github/workflows/`)
-- **`ci.yml`** — Pull Requests para `release`/`main` e push em `release`: build, build da imagem Docker (validação) e `terraform validate`/`fmt`.
-- **`cd.yml`** — push em `main`: build → push da imagem para o ECR → `terraform apply` (idempotente, garante que a infra existe) → `aws lambda update-function-code` com a imagem recém-publicada.
+- **`ci.yml`** — PRs para `develop`/`release`/`main` e push em `develop`/`release`: build .NET, build da imagem Docker (validação), `node --check` do authorizer e `terraform fmt`/`validate`.
+- **`cd.yml`** — push em `release` (homologação) ou `main` (produção), e `workflow_dispatch`: build → push da imagem para o ECR (`:sha` e `:latest`) → `terraform apply` com `image_tag=<sha>`. O `terraform` gerencia a atualização do código da Lambda (`image_uri`), sem passo separado de `update-function-code`.
 
-Branch `main` protegida (sem commit direto, merge somente via Pull Request).
+Branch `main` protegida (sem commit direto, merge somente via Pull Request). Fluxo: feature → `develop` → `release` (deploy homologação) → `main` (deploy produção).
 
 **Secrets necessários no GitHub (Settings → Secrets and variables → Actions):**
 
 | Secret | Descrição |
 |---|---|
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Credenciais temporárias do AWS Academy Learner Lab |
+| `TF_STATE_BUCKET` | Nome do bucket S3 do state (ex.: `techchallenge-tfstate-<ACCOUNT_ID>`) |
 | `RDS_CONNECTION_STRING` | Connection string do mesmo RDS SQL Server usado pela TechChallenge API |
 | `JWT_KEY` | **Idêntica** à `Jwt:Key` configurada na TechChallenge API |
-| `DATADOG_API_KEY` | API Key do Datadog (opcional — sem ela a extensão simplesmente não instrumenta a função) |
+| `DATADOG_API_KEY` | API Key do Datadog (opcional — ver nota em Observabilidade) |
 
-## Observabilidade (Datadog)
+> Se preferir manter tudo em um só ambiente por causa do orçamento do AWS Academy, aponte `release` e `main` para os mesmos recursos (é o padrão atual: mesmo `name_prefix`). Um ambiente de homologação isolado dobra o custo de NLB/Lambda.
 
-A função é instrumentada em duas camadas:
-1. **Datadog Lambda Extension** (copiada para a imagem no `Dockerfile`, ativada via `AWS_LAMBDA_EXEC_WRAPPER=/opt/datadog_wrapper`) — coleta métricas de invocação (duração, erros, throttles, cold starts) e encaminha os logs da função para o Datadog sem precisar de um forwarder separado.
-2. **`Datadog.Trace.Bundle`** (tracer .NET, referenciado no `.csproj`) — instrumenta automaticamente as chamadas HTTP recebidas e as queries EF Core/SQL Server, permitindo correlacionar o trace de `POST /auth/cpf` com os traces subsequentes na TechChallenge API (mesmo `DD_ENV`/`DD_SERVICE` versionados por unified service tagging).
+## Observabilidade
 
-Todas as variáveis (`DD_API_KEY`, `DD_SITE`, `DD_ENV`, `DD_SERVICE`, variáveis de profiler `CORECLR_*`) são injetadas via `terraform/lambda.tf` — nenhum segredo fica hardcoded na imagem. Ver a seção "Observabilidade / Datadog" do [README da TechChallenge API](https://github.com/TechChallenge01/TechChallenge#observabilidade--datadog) para os dashboards e alertas do lado da API principal.
+### Logs estruturados e correlação
+- **API Gateway** — log de acesso em JSON (`terraform/apigateway.tf`, log group `/aws/apigateway/techchallenge-auth`) com `requestId`, `routeKey`, `status`, `responseLatency`, `integrationLatency`, `sourceIp` e o `clienteId` resolvido pelo authorizer.
+- **Correlação** — a integração da rota protegida injeta `x-request-id = $context.requestId` no header repassado ao EKS, para o log da TechChallenge API amarrar na mesma requisição.
+- **Lambdas** — logs em `/aws/lambda/techchallenge-auth` e `/aws/lambda/techchallenge-auth-authorizer` (a Lambda em VPC entrega logs ao CloudWatch normalmente, sem precisar de NAT).
+
+### Datadog (opcional)
+A imagem já traz a **Datadog Lambda Extension** e o `Datadog.Trace.Bundle`. As variáveis `DD_*` só são injetadas (`terraform/lambda_auth.tf`) quando o secret `DATADOG_API_KEY` está preenchido.
+
+> ⚠️ A Lambda de auth roda em **subnet privada sem NAT Gateway** (opção de custo do lab). Sem NAT ou VPC endpoint, a extensão do Datadog não consegue exportar para fora. Para instrumentação completa: mover a Lambda para fora da VPC (e liberar o RDS por outro caminho), adicionar um NAT (~US$32/mês) ou VPC endpoints. Enquanto isso, a observabilidade da auth fica via CloudWatch (métricas de invocação nativas do Lambda + os log groups acima). O authorizer é Node puro, sem Datadog.
+
+Ver a seção "Observabilidade" do [README da TechChallenge API](https://github.com/TechChallenge01/TechChallenge) para os dashboards (volume diário de OS, tempo médio por status, erros de integração) e alertas do lado da API principal.
 
 ## Notas importantes
 - Este serviço **não escreve** no banco — apenas lê `Id`, `Nome`, `Cpf`, `Email` e `Ativo` da tabela `Clientes`, já criada e migrada pela TechChallenge API.

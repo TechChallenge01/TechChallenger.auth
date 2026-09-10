@@ -1,0 +1,13 @@
+# Terraform (o .terraform.lock.hcl DEVE ser commitado — fixa versoes de provider)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Variaveis com segredos — nunca commitar
+*.tfvars
+!*.tfvars.example
+
+# Artefato gerado do Lambda authorizer
+build/
