@@ -94,7 +94,7 @@ variable "jwt_expiration_hours" {
 }
 
 variable "datadog_api_key" {
-  description = "API key do Datadog. Vazio = extensao nao instrumenta (a Lambda roda em subnet privada sem NAT, entao sem VPC endpoint/NAT o Datadog nao consegue exportar de qualquer forma)."
+  description = "API key do Datadog. Quando definida, cria o Datadog Log Forwarder (observability.tf) que encaminha os log groups da auth e do API Gateway para o Datadog. Vazio = sem forwarder (observabilidade so pelo CloudWatch)."
   type        = string
   sensitive   = true
   default     = ""

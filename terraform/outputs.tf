@@ -42,3 +42,8 @@ output "vpc_link_id" {
   description = "ID do VPC Link do API Gateway"
   value       = aws_apigatewayv2_vpc_link.eks.id
 }
+
+output "datadog_forwarder_name" {
+  description = "Nome do Datadog Log Forwarder (vazio quando datadog_api_key nao e definida)"
+  value       = local.datadog_enabled ? aws_lambda_function.datadog_forwarder[0].function_name : ""
+}

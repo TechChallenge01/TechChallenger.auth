@@ -11,7 +11,7 @@ terraform {
       version = "~> 2.4"
     }
   }
-  
+
   backend "s3" {
     key     = "techchallenge-auth/terraform.tfstate"
     region  = "us-east-1"

@@ -36,6 +36,9 @@ resource "aws_cloudwatch_log_group" "auth" {
 }
 
 locals {
+  # A Lambda de auth roda em subnet privada sem NAT — nao tem egress para o
+  # Datadog. A observabilidade dela vai pelo CloudWatch -> Datadog Log Forwarder
+  # (ver observability.tf), nao por instrumentacao em processo.
   auth_base_env = {
     ConnectionStrings__DefaultConnection = var.db_connection_string
     Jwt__Key                             = var.jwt_key
@@ -43,16 +46,6 @@ locals {
     Jwt__Audience                        = var.jwt_audience
     Jwt__ExpiracaoHoras                  = var.jwt_expiration_hours
     ASPNETCORE_ENVIRONMENT               = "Production"
-  }
-
-  auth_datadog_env = var.datadog_api_key == "" ? {} : {
-    DD_API_KEY              = var.datadog_api_key
-    DD_SITE                 = var.datadog_site
-    DD_ENV                  = var.datadog_env
-    DD_SERVICE              = var.name_prefix
-    DD_VERSION              = var.image_tag
-    DD_TRACE_ENABLED        = "true"
-    AWS_LAMBDA_EXEC_WRAPPER = "/opt/datadog_wrapper"
   }
 }
 
@@ -71,7 +64,7 @@ resource "aws_lambda_function" "auth" {
   }
 
   environment {
-    variables = merge(local.auth_base_env, local.auth_datadog_env)
+    variables = local.auth_base_env
   }
 
   tags = {
