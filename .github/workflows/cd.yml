@@ -20,6 +20,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ github.ref_name == 'main' && 'production' || 'homolog' }}
+    env:
+      TF_VAR_db_connection_string: ${{ secrets.RDS_CONNECTION_STRING }}
+      TF_VAR_jwt_key: ${{ secrets.JWT_KEY }}
+      TF_VAR_datadog_api_key: ${{ secrets.DATADOG_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,14 +55,14 @@ jobs:
 
       - name: Terraform init
         working-directory: terraform
-        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+        run: terraform init -input=false -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
 
       # O Terraform e dono do repositorio ECR. Criamos so ele primeiro, para
       # ter onde dar push da imagem antes do apply completo (a Lambda de imagem
       # nao e criada sem uma imagem existente).
       - name: Terraform apply (somente ECR)
         working-directory: terraform
-        run: terraform apply -auto-approve -target=aws_ecr_repository.auth -target=aws_ecr_lifecycle_policy.auth
+        run: terraform apply -auto-approve -input=false -target=aws_ecr_repository.auth -target=aws_ecr_lifecycle_policy.auth
 
       - name: Build e push da imagem
         id: image
@@ -75,10 +79,7 @@ jobs:
         working-directory: terraform
         env:
           TF_VAR_image_tag: ${{ steps.image.outputs.tag }}
-          TF_VAR_db_connection_string: ${{ secrets.RDS_CONNECTION_STRING }}
-          TF_VAR_jwt_key: ${{ secrets.JWT_KEY }}
-          TF_VAR_datadog_api_key: ${{ secrets.DATADOG_API_KEY }}
         run: |
-          terraform apply -auto-approve
+          terraform apply -auto-approve -input=false
           echo "### Endpoints" >> "$GITHUB_STEP_SUMMARY"
           terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$GITHUB_STEP_SUMMARY"
