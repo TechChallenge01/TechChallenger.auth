@@ -135,3 +135,7 @@ _NCrunch*
 auth.local.env
 /event.json
 ev_*.json
+
+# Terraform (auth usa backend S3; artefatos locais nao versionados)
+terraform/.terraform/
+terraform/dd-forwarder.zip
