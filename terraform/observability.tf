@@ -34,9 +34,11 @@ resource "aws_lambda_function" "datadog_forwarder" {
   timeout       = 120
   memory_size   = 256
 
-  # Zip publicado pela Datadog (bucket publico). Fica FORA de VPC -> tem egress.
-  s3_bucket = "datadog-cloudformation-template"
-  s3_key    = "aws/forwarder/latest.zip"
+  # O AWS Academy bloqueia GetObject em buckets S3 de outras contas, entao nao da
+  # para apontar direto para o bucket publico da Datadog. A esteira (cd.yml) baixa
+  # o zip do release oficial da Datadog e o deploy vai pelo pacote local.
+  filename         = "${path.module}/dd-forwarder.zip"
+  source_code_hash = fileexists("${path.module}/dd-forwarder.zip") ? filebase64sha256("${path.module}/dd-forwarder.zip") : null
 
   environment {
     variables = {
