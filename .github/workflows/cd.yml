@@ -53,6 +53,17 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # O forwarder do Datadog nao pode ser puxado do S3 publico deles no AWS
+      # Academy (GetObject cross-account bloqueado). Baixamos o release oficial
+      # e o observability.tf faz o deploy a partir do arquivo local.
+      - name: Baixar Datadog Log Forwarder
+        working-directory: terraform
+        env:
+          DD_FORWARDER_VERSION: "5.4.13"
+        run: |
+          curl -sSfL -o dd-forwarder.zip "https://github.com/DataDog/datadog-serverless-functions/releases/download/aws-dd-forwarder-$DD_FORWARDER_VERSION/aws-dd-forwarder-$DD_FORWARDER_VERSION.zip"
+          ls -la dd-forwarder.zip
+
       - name: Terraform init
         working-directory: terraform
         run: terraform init -input=false -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
