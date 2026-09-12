@@ -264,6 +264,10 @@ Sem `DATADOG_API_KEY`: sem forwarder — a observabilidade da auth fica pelo Clo
 
 Ver a seção "Observabilidade" do [README da TechChallenge API](https://github.com/TechChallenge01/TechChallenge) para o agente Datadog no EKS, os dashboards (volume diário de OS, tempo médio por status, erros de integração) e os alertas do lado da API principal.
 
+## Documentação Arquitetural
+
+Diagrama de componentes, diagramas de sequência, modelo ER, RFCs e ADRs cobrindo os 4 repositórios do Tech Challenge estão em [`docs/architecture/`](https://github.com/TechChallenge01/TechChallenge/tree/main/docs/architecture), no repositório `TechChallenge`.
+
 ## Notas importantes
 - Este serviço **não escreve** no banco — apenas lê `Id`, `Nome`, `Cpf`, `Email` e `Ativo` da tabela `Clientes`, já criada e migrada pela TechChallenge API.
 - O CPF é validado com o mesmo algoritmo de dígito verificador usado no Value Object `Cpf` da TechChallenge API, para manter consistência de regra de negócio entre os dois repositórios.
